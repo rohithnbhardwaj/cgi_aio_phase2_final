@@ -1,0 +1,13 @@
+FROM ollama/ollama:latest
+
+USER root
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates curl \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY zscaler-root.crt /usr/local/share/ca-certificates/zscaler-root.crt
+RUN update-ca-certificates || true
+
+ENTRYPOINT ["/bin/ollama"]
+CMD ["serve"]

@@ -1,0 +1,9 @@
+streamlit-app/
+├── Dockerfile
+├── docker-compose.yml
+├── start.sh
+├── stop.sh
+├── requirements.txt
+├── streamlit_app.py
+├── zscaler-root.crt   # optional if corporate CA required
+└── uploads/           # created at runtime, persisted by volume
