@@ -1,0 +1,700 @@
+from __future__ import annotations
+
+"""LangGraph-primary deterministic workflow for CGI AIO.
+
+Hybrid v1 additions:
+- supports three explicit routes: rag, data, hybrid
+- classifies doc/tooling/policy questions before any DB destructive guard
+- applies destructive guard only on the SQL-bearing paths (data + hybrid SQL sub-question)
+- preserves golden SQL -> NL->SQL -> SQL safety -> execute order
+- adds a bounded hybrid path: retrieve policy/doc context + derive one SQL sub-question + synthesize one final answer
+"""
+
+from functools import lru_cache
+from typing import Any, Dict, List, Literal, TypedDict
+import json
+import re
+
+from langgraph.graph import END, START, StateGraph
+
+from backend import feedback_store, llm_router, nl_to_sql, rag
+from backend.hybrid_qa import (
+    _db_down_response,
+    _is_db_unavailable_error,
+    _looks_like_policy_question,
+    _sql_is_placeholder_answer,
+)
+from backend.langsmith_observability import traceable
+
+
+class RouterState(TypedDict, total=False):
+    question: str
+    debug: Dict[str, Any]
+    route: Literal["data", "rag", "hybrid", "blocked", "none"]
+    enable_langsmith: bool
+    schema_context: str
+    sql_question: str
+    sql: str
+    rows: List[Dict[str, Any]]
+    columns: List[str]
+    sources: List[str]
+    hits: List[Dict[str, Any]]
+    answer: str
+    final: Dict[str, Any]
+    golden_hit: bool
+    empty_or_placeholder_sql: bool
+    hybrid_sql_empty: bool
+    hybrid_sql_error: str
+
+
+DOC_TOOLING_HINTS = {
+    "bamboo", "jira", "confluence", "bitbucket", "atlassian",
+    "repository", "repo", "source repository", "build plan", "pipeline",
+    "deployment", "agent", "branch", "checkout", "artifact", "plan",
+    "documentation", "docs", "guide", "manual", "knowledge base", "kb",
+    "vpn", "onboarding", "policy", "pto", "holiday", "hr", "benefits",
+    "sla", "priority", "support", "service level", "commitment",
+}
+PROCEDURAL_HINTS = {
+    "how to", "how do i", "steps", "process", "procedure", "configure",
+    "configuration", "setup", "set up", "guide", "manual",
+}
+DATA_HINTS = {
+    "how many", "count", "tasks", "task", "projects", "project", "users", "user",
+    "team", "teams", "status", "due in the next", "next 7 days", "next seven days",
+    "overdue", "open items", "not done", "incomplete", "on track", "meet commitments",
+    "volume", "rows", "records",
+}
+DB_CONTEXT_HINTS = {
+    "sql", "database", "db", "table", "row", "record", "insert into",
+    "delete from", "update ", "drop table", "truncate", "alter table", "create table",
+}
+DESTRUCTIVE_RE = re.compile(
+    r"\b(delete|drop|truncate|wipe|purge|remove|update|insert|alter|create|grant|revoke|replace)\b",
+    re.IGNORECASE,
+)
+
+
+def _norm(q: str) -> str:
+    return (q or "").strip().lower()
+
+
+def _looks_like_doc_or_tooling_question(q: str) -> bool:
+    ql = _norm(q)
+    if not ql:
+        return False
+    if _looks_like_policy_question(ql):
+        return True
+    if any(k in ql for k in DOC_TOOLING_HINTS):
+        return True
+    if any(k in ql for k in PROCEDURAL_HINTS) and any(k in ql for k in DOC_TOOLING_HINTS):
+        return True
+    return False
+
+
+def _looks_like_data_question(q: str) -> bool:
+    ql = _norm(q)
+    if not ql:
+        return False
+    if any(k in ql for k in DATA_HINTS):
+        return True
+    # Basic factual SQL-ish asks
+    return bool(re.search(r"\b(list|show|count|find|which|what are|what is the number of)\b", ql)) and any(
+        t in ql for t in ("user", "users", "task", "tasks", "project", "projects", "team", "teams", "status")
+    )
+
+
+def _looks_like_hybrid_question(q: str) -> bool:
+    ql = _norm(q)
+    if not ql:
+        return False
+
+    has_doc = _looks_like_doc_or_tooling_question(ql)
+    has_data = _looks_like_data_question(ql)
+
+    if has_doc and has_data:
+        return True
+
+    explicit_blends = [
+        "according to",
+        "based on",
+        "using the",
+        "and based on",
+        "are we on track",
+    ]
+    return any(p in ql for p in explicit_blends) and (has_doc or any(k in ql for k in DOC_TOOLING_HINTS)) and (
+        has_data or any(k in ql for k in DATA_HINTS)
+    )
+
+
+def _looks_like_destructive_db_intent(q: str) -> bool:
+    ql = _norm(q)
+    if not ql:
+        return False
+    if _looks_like_doc_or_tooling_question(ql):
+        return False
+    if any(k in ql for k in PROCEDURAL_HINTS):
+        return False
+    if not DESTRUCTIVE_RE.search(ql):
+        return False
+    return any(k in ql for k in DB_CONTEXT_HINTS) or bool(
+        re.search(r"\b(delete all|drop|truncate|insert|update|alter|create table)\b", ql)
+    )
+
+
+def _derive_hybrid_sql_question(question: str) -> str:
+    ql = _norm(question)
+
+    # Deterministic heuristics first
+    if ("task" in ql or "tasks" in ql) and ("next 7 days" in ql or "next seven days" in ql):
+        if "on track" in ql or "commitments" in ql or "sla" in ql or "priority" in ql:
+            return "How many tasks are due in the next 7 days, and how many of those tasks are not done?"
+        return "How many tasks are due in the next 7 days?"
+
+    if ("overdue" in ql) and ("task" in ql or "tasks" in ql):
+        return "Show overdue tasks (due date before today and not done)"
+
+    if ("project" in ql or "projects" in ql) and "team" in ql and "status" in ql:
+        return "Show projects with their team name and status"
+
+    if ("user" in ql or "users" in ql) and "email" in ql:
+        return "List user emails"
+
+    # Bounded LLM fallback: rewrite only the data-bearing part as one SQL-friendly question
+    try:
+        rewritten = llm_router.chat_completion(
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Rewrite the user's mixed policy/data request into ONE short SQL-friendly data question. "
+                        "Keep only the structured-data part. Return a single sentence and nothing else."
+                    ),
+                },
+                {"role": "user", "content": question},
+            ],
+            temperature=0.0,
+            max_tokens=80,
+        )
+        rewritten = (rewritten or "").strip().splitlines()[0].strip()
+        return rewritten or question
+    except Exception:
+        return question
+
+
+def _build_policy_context(hits: List[Dict[str, Any]]) -> tuple[str, List[str]]:
+    sources: List[str] = []
+    blocks: List[str] = []
+    for i, h in enumerate(hits or [], start=1):
+        meta = h.get("meta") or {}
+        src = meta.get("source") or meta.get("file") or "document"
+        if src and src not in sources:
+            sources.append(src)
+        blocks.append(f"[{i}] {src}\n{(h.get('text') or '').strip()}")
+    return "\n\n---\n\n".join(blocks), sources
+
+
+def _sql_fact_block(rows: List[Dict[str, Any]], columns: List[str]) -> str:
+    rows = rows or []
+    columns = columns or []
+    if not rows:
+        return "SQL_FACTS: The SQL query returned 0 rows."
+    preview = rows[:10]
+    try:
+        payload = json.dumps(preview, indent=2, default=str)
+    except Exception:
+        payload = str(preview)
+    return f"SQL_FACTS: Returned {len(rows)} row(s). Columns: {columns}. Preview:\n{payload}"
+
+
+@traceable(name="normalize_question", run_type="chain")
+def normalize_question(state: RouterState) -> RouterState:
+    q = (state.get("question") or "").strip()
+    if not q:
+        return {
+            "route": "none",
+            "final": {
+                "mode": "none",
+                "answer": "Please enter a question.",
+                "sql": "",
+                "rows": [],
+                "columns": [],
+                "sources": [],
+                "debug": {"reason": "empty_question", "router": "langgraph", "router_impl": "langgraph_primary"},
+            },
+        }
+    return {"question": q, "debug": {"router": "langgraph", "router_impl": "langgraph_primary"}}
+
+
+@traceable(name="classify_route", run_type="chain")
+def classify_route(state: RouterState) -> RouterState:
+    q = state["question"]
+
+    if _looks_like_hybrid_question(q):
+        return {
+            "route": "hybrid",
+            "debug": {
+                **state.get("debug", {}),
+                "route": "hybrid",
+                "route_reason": "policy_plus_data_signals",
+            },
+        }
+
+    if _looks_like_doc_or_tooling_question(q):
+        return {
+            "route": "rag",
+            "debug": {
+                **state.get("debug", {}),
+                "route": "rag",
+                "route_reason": "policy_or_doc_keywords",
+            },
+        }
+
+    return {
+        "route": "data",
+        "debug": {
+            **state.get("debug", {}),
+            "route": "data",
+            "route_reason": "default_data_path",
+        },
+    }
+
+
+@traceable(name="destructive_guard", run_type="chain")
+def destructive_guard(state: RouterState) -> RouterState:
+    q_for_guard = state.get("sql_question") or state.get("question", "")
+    if _looks_like_destructive_db_intent(q_for_guard):
+        return {
+            "route": "blocked",
+            "final": {
+                "mode": "sql",
+                "sql": "",
+                "rows": [],
+                "columns": [],
+                "answer": (
+                    "For safety, I can’t run destructive database actions (DELETE/DROP/TRUNCATE/etc.). "
+                    "I can help with read-only questions like:\n"
+                    "- \"Show all users\"\n"
+                    "- \"How many users are there?\"\n"
+                    "- \"List user emails\""
+                ),
+                "sources": [],
+                "debug": {**state.get("debug", {}), "reason": "blocked_destructive_intent", "route": "blocked"},
+            },
+        }
+    return {}
+
+
+@traceable(name="rag_retrieve", run_type="retriever")
+def rag_retrieve_node(state: RouterState) -> RouterState:
+    hits = rag.retrieve(state["question"], k=4)
+    return {"hits": hits}
+
+
+@traceable(name="hybrid_prepare_sql", run_type="chain")
+def hybrid_prepare_sql_node(state: RouterState) -> RouterState:
+    sql_q = _derive_hybrid_sql_question(state["question"])
+    return {
+        "sql_question": sql_q,
+        "debug": {**state.get("debug", {}), "hybrid_sql_question": sql_q},
+    }
+
+
+@traceable(name="fetch_schema_context", run_type="retriever")
+def fetch_schema_context_node(state: RouterState) -> RouterState:
+    try:
+        return {"schema_context": nl_to_sql.fetch_schema_context()}
+    except Exception as e:
+        return {"schema_context": "", "debug": {**state.get("debug", {}), "schema_context_error": str(e)}}
+
+
+@traceable(name="golden_lookup", run_type="retriever")
+def golden_lookup_node(state: RouterState) -> RouterState:
+    q = state.get("sql_question") or state["question"]
+    hit = feedback_store.find_best_golden_sql(q)
+    if not hit:
+        return {"golden_hit": False}
+    sql, gdbg = hit
+    return {"golden_hit": True, "sql": sql, "debug": {**state.get("debug", {}), **gdbg}}
+
+
+@traceable(name="nl_to_sql", run_type="llm")
+def nl2sql_node(state: RouterState) -> RouterState:
+    sql_q = state.get("sql_question") or state["question"]
+    sql, sdbg = nl_to_sql.generate_sql(sql_q, schema_context=state.get("schema_context") or None)
+    return {"sql": sql, "debug": {**state.get("debug", {}), **sdbg}}
+
+
+@traceable(name="sql_safety", run_type="chain")
+def sql_safety_node(state: RouterState) -> RouterState:
+    try:
+        sql_norm = nl_to_sql.validate_and_normalize_sql(state["sql"])
+        return {"sql": sql_norm}
+    except Exception as e:
+        return {
+            "final": {
+                "mode": "sql",
+                "sql": state.get("sql", ""),
+                "rows": [],
+                "columns": [],
+                "answer": f"SQL blocked by safety rules: {e}",
+                "sources": [],
+                "debug": {**state.get("debug", {}), "reason": "sql_safety_blocked", "sql_error": str(e)},
+            }
+        }
+
+
+@traceable(name="execute_sql", run_type="tool")
+def execute_sql_node(state: RouterState) -> RouterState:
+    try:
+        sql = state.get("sql", "") or ""
+        rows, cols = nl_to_sql.execute_sql(sql)
+
+        if state.get("route") == "hybrid":
+            return {
+                "rows": rows,
+                "columns": cols,
+                "hybrid_sql_empty": _sql_is_placeholder_answer(sql, rows, cols) or len(rows) == 0,
+                "debug": {**state.get("debug", {}), "sql_branch": "hybrid"},
+            }
+
+        # data route
+        if rows:
+            return {
+                "rows": rows,
+                "columns": cols,
+                "final": {
+                    "mode": "sql",
+                    "sql": sql,
+                    "rows": rows,
+                    "columns": cols,
+                    "answer": f"Returned {len(rows)} row(s).",
+                    "sources": [],
+                    "debug": {
+                        **state.get("debug", {}),
+                        "reason": "golden_sql_success" if state.get("golden_hit") else "sql_success",
+                        "route": "data",
+                    },
+                },
+            }
+
+        empty_or_placeholder = _sql_is_placeholder_answer(sql, rows, cols)
+
+        if empty_or_placeholder:
+            return {
+                "empty_or_placeholder_sql": True,
+                "debug": {
+                    **state.get("debug", {}),
+                    "route": "rag",
+                    "route_reason": "sql_empty_or_placeholder_fallback",
+                },
+            }
+
+        if len(rows) == 0 and _looks_like_doc_or_tooling_question(state["question"]):
+            return {
+                "empty_or_placeholder_sql": True,
+                "debug": {
+                    **state.get("debug", {}),
+                    "route": "rag",
+                    "route_reason": "sql_empty_docish_fallback",
+                },
+            }
+
+        return {
+            "rows": rows,
+            "columns": cols,
+            "final": {
+                "mode": "sql",
+                "sql": sql,
+                "rows": rows,
+                "columns": cols,
+                "answer": "Returned 0 row(s).",
+                "sources": [],
+                "debug": {
+                    **state.get("debug", {}),
+                    "reason": "golden_sql_success" if state.get("golden_hit") else "sql_success",
+                    "route": "data",
+                },
+            },
+        }
+
+    except Exception as e:
+        if _is_db_unavailable_error(e):
+            return {
+                "final": _db_down_response(
+                    debug={**state.get("debug", {}), "sql_provider": state.get("debug", {}).get("sql_provider", "unknown")},
+                    sql=state.get("sql", ""),
+                )
+            }
+
+        if state.get("route") == "hybrid":
+            return {
+                "rows": [],
+                "columns": [],
+                "hybrid_sql_empty": True,
+                "hybrid_sql_error": str(e),
+                "debug": {**state.get("debug", {}), "sql_error": str(e), "sql_branch": "hybrid"},
+            }
+
+        if _looks_like_doc_or_tooling_question(state["question"]):
+            return {
+                "debug": {
+                    **state.get("debug", {}),
+                    "sql_error": str(e),
+                    "route": "rag",
+                    "route_reason": "sql_error_doc_fallback",
+                },
+                "empty_or_placeholder_sql": True,
+            }
+
+        return {
+            "final": {
+                "mode": "sql",
+                "sql": state.get("sql", ""),
+                "rows": [],
+                "columns": [],
+                "answer": f"SQL execution error: {e}",
+                "sources": [],
+                "debug": {**state.get("debug", {}), "reason": "sql_execution_error", "sql_error": str(e)},
+            }
+        }
+
+
+@traceable(name="rag_answer", run_type="llm")
+def rag_answer_node(state: RouterState) -> RouterState:
+    hits = state.get("hits") or []
+    if not hits:
+        return {
+            "final": {
+                "mode": "rag",
+                "sql": "",
+                "rows": [],
+                "columns": [],
+                "answer": "I couldn't find anything relevant in the knowledge documents.",
+                "sources": [],
+                "debug": {**state.get("debug", {}), "reason": "no_hits", "k": 4, "collection": "docs", "route": "rag"},
+            }
+        }
+
+    context, sources = _build_policy_context(hits)
+    content = llm_router.chat_completion(
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are CGI AIO Assistant. Answer the user's question using ONLY the provided context "
+                    "from internal documents. If the answer is not in the context, say you don't know. "
+                    "Be concise and actionable."
+                ),
+            },
+            {"role": "user", "content": f"Question: {state['question']}\n\nContext:\n{context}\n\nAnswer:"},
+        ],
+        temperature=0.2,
+        max_tokens=400,
+    )
+
+    return {
+        "sources": sources,
+        "final": {
+            "mode": "rag",
+            "sql": "",
+            "rows": [],
+            "columns": [],
+            "answer": (content or "").strip(),
+            "sources": sources,
+            "debug": {
+                **state.get("debug", {}),
+                "reason": "policy_rag" if _looks_like_doc_or_tooling_question(state["question"]) else "rag_success",
+                "k": 4,
+                "collection": "docs",
+                "route": "rag",
+            },
+        },
+    }
+
+
+@traceable(name="hybrid_synthesize", run_type="llm")
+def hybrid_synthesize_node(state: RouterState) -> RouterState:
+    hits = state.get("hits") or []
+    context, sources = _build_policy_context(hits)
+    sql = state.get("sql", "") or ""
+    rows = state.get("rows") or []
+    cols = state.get("columns") or []
+
+    if not hits and not rows:
+        return {
+            "final": {
+                "mode": "hybrid",
+                "sql": sql,
+                "rows": rows,
+                "columns": cols,
+                "answer": "I couldn't combine policy documents and live data for that request.",
+                "sources": sources,
+                "debug": {
+                    **state.get("debug", {}),
+                    "reason": "hybrid_no_policy_and_no_data",
+                    "route": "hybrid",
+                    "collection": "docs",
+                },
+            }
+        }
+
+    sql_fact_block = _sql_fact_block(rows, cols)
+    policy_block = context or "POLICY_CONTEXT: No relevant policy or document passages were retrieved."
+    sql_q = state.get("sql_question") or state["question"]
+    sql_error = state.get("hybrid_sql_error") or ""
+
+    content = llm_router.chat_completion(
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are CGI AIO Assistant. Produce one concise, grounded hybrid answer. "
+                    "Use ONLY the policy/document context and SQL facts provided. "
+                    "If the policy context is missing, say that policy support could not be verified. "
+                    "If the SQL facts are missing or empty, say that live data could not be confirmed. "
+                    "Do not invent numbers or policies."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Original question:\n{state['question']}\n\n"
+                    f"SQL sub-question:\n{sql_q}\n\n"
+                    f"{policy_block}\n\n"
+                    f"{sql_fact_block}\n\n"
+                    f"SQL_ERROR: {sql_error}\n\n"
+                    "Final hybrid answer:"
+                ),
+            },
+        ],
+        temperature=0.1,
+        max_tokens=450,
+    )
+
+    return {
+        "sources": sources,
+        "final": {
+            "mode": "hybrid",
+            "sql": sql,
+            "rows": rows,
+            "columns": cols,
+            "answer": (content or "").strip(),
+            "sources": sources,
+            "debug": {
+                **state.get("debug", {}),
+                "reason": "hybrid_success",
+                "route": "hybrid",
+                "collection": "docs",
+                "sql_question": sql_q,
+                "hybrid_sql_empty": bool(state.get("hybrid_sql_empty")),
+                **({"hybrid_sql_error": sql_error} if sql_error else {}),
+            },
+        },
+    }
+
+
+def after_classify(state: RouterState) -> str:
+    if state.get("route") in {"rag", "hybrid"}:
+        return "rag_retrieve"
+    return "guardrails"
+
+
+def after_rag_retrieve(state: RouterState) -> str:
+    if state.get("route") == "hybrid":
+        return "hybrid_prepare_sql"
+    return "rag_answer"
+
+
+def after_guardrails(state: RouterState) -> str:
+    if state.get("final"):
+        return "finalize"
+    return "fetch_schema_context"
+
+
+def after_golden_lookup(state: RouterState) -> str:
+    if state.get("golden_hit"):
+        return "sql_safety"
+    return "nl_to_sql"
+
+
+def after_sql_safety(state: RouterState) -> str:
+    if state.get("final"):
+        return "finalize"
+    return "execute_sql"
+
+
+def after_execute_sql(state: RouterState) -> str:
+    if state.get("final"):
+        return "finalize"
+    if state.get("route") == "hybrid":
+        return "hybrid_synthesize"
+    return "rag_retrieve"
+
+
+def finalize_node(state: RouterState) -> RouterState:
+    final = state.get("final") or {
+        "mode": "error",
+        "sql": state.get("sql", ""),
+        "rows": state.get("rows", []),
+        "columns": state.get("columns", []),
+        "answer": "Something went wrong while answering. Try again or check logs.",
+        "sources": state.get("sources", []),
+        "debug": {**state.get("debug", {}), "reason": "unhandled_state"},
+    }
+    return {"final": final}
+
+
+@lru_cache(maxsize=1)
+def get_compiled_graph():
+    graph = StateGraph(RouterState)
+
+    graph.add_node("normalize", normalize_question)
+    graph.add_node("classify", classify_route)
+    graph.add_node("rag_retrieve", rag_retrieve_node)
+    graph.add_node("rag_answer", rag_answer_node)
+    graph.add_node("hybrid_prepare_sql", hybrid_prepare_sql_node)
+    graph.add_node("guardrails", destructive_guard)
+    graph.add_node("fetch_schema_context", fetch_schema_context_node)
+    graph.add_node("golden_lookup", golden_lookup_node)
+    graph.add_node("nl_to_sql", nl2sql_node)
+    graph.add_node("sql_safety", sql_safety_node)
+    graph.add_node("execute_sql", execute_sql_node)
+    graph.add_node("hybrid_synthesize", hybrid_synthesize_node)
+    graph.add_node("finalize", finalize_node)
+
+    graph.add_edge(START, "normalize")
+    graph.add_edge("normalize", "classify")
+    graph.add_conditional_edges("classify", after_classify, {
+        "rag_retrieve": "rag_retrieve",
+        "guardrails": "guardrails",
+    })
+    graph.add_conditional_edges("rag_retrieve", after_rag_retrieve, {
+        "rag_answer": "rag_answer",
+        "hybrid_prepare_sql": "hybrid_prepare_sql",
+    })
+    graph.add_edge("hybrid_prepare_sql", "guardrails")
+    graph.add_conditional_edges("guardrails", after_guardrails, {
+        "fetch_schema_context": "fetch_schema_context",
+        "finalize": "finalize",
+    })
+    graph.add_edge("fetch_schema_context", "golden_lookup")
+    graph.add_conditional_edges("golden_lookup", after_golden_lookup, {
+        "sql_safety": "sql_safety",
+        "nl_to_sql": "nl_to_sql",
+    })
+    graph.add_edge("nl_to_sql", "sql_safety")
+    graph.add_conditional_edges("sql_safety", after_sql_safety, {
+        "execute_sql": "execute_sql",
+        "finalize": "finalize",
+    })
+    graph.add_conditional_edges("execute_sql", after_execute_sql, {
+        "finalize": "finalize",
+        "rag_retrieve": "rag_retrieve",
+        "hybrid_synthesize": "hybrid_synthesize",
+    })
+    graph.add_edge("rag_answer", "finalize")
+    graph.add_edge("hybrid_synthesize", "finalize")
+    graph.add_edge("finalize", END)
+
+    return graph.compile()

@@ -1,0 +1,4 @@
+{"question": "Show me all user emails", "expected_mode": "sql"}
+{"question": "How many projects are active?", "expected_mode": "sql"}
+{"question": "What does the Bamboo documentation say about Node.js project configuration?", "expected_mode": "rag"}
+{"question": "Drop table users", "expected_mode": "blocked"}
